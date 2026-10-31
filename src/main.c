@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "board.h"
 #include "config.h"
+#include "matchmaker.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -35,7 +36,8 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    printf("[torneo] N=%ld jugadores, M=%ld mesas (matchmaker pendiente)\n", n, m);
+    printf("[torneo] N=%ld jugadores, M=%ld mesas \n", n, m);
+    torneo_run((int)n, (int)m, have_suite ? &suite.cases[0] : NULL);
 
     /* Demo del tablero: Puma en el centro */
     Board b;
