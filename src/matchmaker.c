@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +12,7 @@
 #include "mesa.h"
 
 /* ---------- estado compartido ---------- */
-static atomic_int g_apagado = 0;          /* 1 = hay que cerrar (Ctrl+C, luego) */
+static atomic_int g_apagado = 0;          /* 1 = Ctrl+C recibido, hay que cerrar */
 static sem_t g_mesas_libres;              /* permisos disponibles = mesas libres */
 static pthread_mutex_t g_q_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_q_cond = PTHREAD_COND_INITIALIZER;
@@ -30,27 +31,33 @@ static void dormir_ms(long ms) {
     nanosleep(&ts, NULL);
 }
 
-/* Hilo cliente: llega (tras un retardo) y se anota en la fila. */
+/* Hilo cliente: llega (tras un retardo) y se anota en la fila.
+ * Si ya se pidio apagar, el jugador es rechazado (no se aceptan nuevos). */
 static void *hilo_cliente(void *arg) {
     int id = (int)(intptr_t)arg;
     dormir_ms((long)((unsigned)id * 7919u % 100));   /* llegada escalonada */
     pthread_mutex_lock(&g_q_mutex);
-    g_cola[g_q_tail++] = id;
+    if (!atomic_load(&g_apagado)) {
+        g_cola[g_q_tail++] = id;
+        printf("[matchmaker] jugador %d llego\n", id);
+    } else {
+        printf("[matchmaker] jugador %d rechazado (servidor cerrando)\n", id);
+    }
     g_llegados++;
-    printf("[matchmaker] jugador %d llego\n", id);
     pthread_cond_broadcast(&g_q_cond);               /* avisa al matchmaker */
     pthread_mutex_unlock(&g_q_mutex);
     return NULL;
 }
 
 /* Saca 2 jugadores de la fila. Si no hay, duerme (sin busy-wait).
- * Devuelve 1 si saco una pareja, 0 si ya no habra mas parejas. */
+ * Devuelve 1 si saco una pareja, 0 si ya no habra mas (fin o apagado). */
 static int sacar_pareja(int *puma, int *perros) {
     int ok = 0;
     pthread_mutex_lock(&g_q_mutex);
-    while ((g_q_tail - g_q_head) < 2 && g_llegados < g_total)
+    while (!atomic_load(&g_apagado) &&
+           (g_q_tail - g_q_head) < 2 && g_llegados < g_total)
         pthread_cond_wait(&g_q_cond, &g_q_mutex);
-    if ((g_q_tail - g_q_head) >= 2) {
+    if (!atomic_load(&g_apagado) && (g_q_tail - g_q_head) >= 2) {
         *puma = g_cola[g_q_head++];
         *perros = g_cola[g_q_head++];
         ok = 1;
@@ -69,9 +76,27 @@ static void *hilo_mesa(void *arg) {
     return NULL;
 }
 
+/* Hilo de senales: espera SIGINT con sigwait. Al llegar, pide el apagado
+ * y despierta a todo el que pueda estar durmiendo. */
+static void *hilo_senales(void *arg) {
+    sigset_t *set = arg;
+    int sig = 0;
+    if (sigwait(set, &sig) != 0) return NULL;
+    if (sig == SIGINT) {
+        printf("\n[servidor] SIGINT recibido: cerrando ordenadamente...\n");
+        atomic_store(&g_apagado, 1);                 /* 1) levantar el flag */
+        pthread_mutex_lock(&g_q_mutex);
+        pthread_cond_broadcast(&g_q_cond);           /* 2) despierta cond_wait */
+        pthread_mutex_unlock(&g_q_mutex);
+        sem_post(&g_mesas_libres);                   /* 3) despierta sem_wait */
+    }
+    return NULL;
+}
+
 int torneo_run(int n, int m, const TestCase *tc) {
     g_tc = tc;
     g_total = n;
+    atomic_store(&g_apagado, 0);
     g_cola = calloc((size_t)n, sizeof(int));
     pthread_t *clientes = malloc((size_t)n * sizeof(pthread_t));
     pthread_t *mesas = malloc((size_t)(n / 2 + 1) * sizeof(pthread_t));
@@ -82,15 +107,31 @@ int torneo_run(int n, int m, const TestCase *tc) {
     }
     sem_init(&g_mesas_libres, 0, (unsigned)m);
 
-    /* 1) lanzar los N clientes */
+    /* 1) bloquear SIGINT y SIGUSR1 ANTES de crear hilos (los hijos heredan
+     *    la mascara). Solo el hilo de senales las recibe, con sigwait. */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    pthread_t th_sig;
+    pthread_create(&th_sig, NULL, hilo_senales, &set);
+
+    /* 2) lanzar los N clientes */
     for (int i = 0; i < n; i++)
         pthread_create(&clientes[i], NULL, hilo_cliente, (void *)(intptr_t)i);
 
-    /* 2) bucle del matchmaker: pareja -> esperar mesa libre -> lanzar mesa */
+    /* 3) bucle del matchmaker: pareja -> esperar mesa libre -> lanzar mesa */
     int n_mesas = 0, puma, perros;
     while (sacar_pareja(&puma, &perros)) {
         while (sem_wait(&g_mesas_libres) == -1 && errno == EINTR)
             ;                                        /* espera pasiva */
+        if (atomic_load(&g_apagado)) {               /* nos desperto Ctrl+C */
+            printf("[matchmaker] apagado: pareja (%d,%d) no alcanzo mesa\n",
+                   puma, perros);
+            break;
+        }
         MesaArgs *a = malloc(sizeof *a);
         a->id_mesa = n_mesas;
         a->puma = puma;
@@ -100,14 +141,22 @@ int torneo_run(int n, int m, const TestCase *tc) {
         pthread_create(&mesas[n_mesas++], NULL, hilo_mesa, a);
     }
 
-    /* 3) esperar a que todos terminen (join) */
+    /* 4) cierre ordenado: esperar a TODOS los hilos */
     for (int i = 0; i < n; i++) pthread_join(clientes[i], NULL);
     for (int i = 0; i < n_mesas; i++) pthread_join(mesas[i], NULL);
 
-    if (g_q_tail - g_q_head == 1)
+    pthread_mutex_lock(&g_q_mutex);
+    int sobran = g_q_tail - g_q_head;
+    if (atomic_load(&g_apagado))
+        printf("[matchmaker] %d jugador(es) en espera descartados por el cierre\n", sobran);
+    else if (sobran == 1)
         printf("[matchmaker] jugador %d queda sin pareja (N impar)\n", g_cola[g_q_head]);
+    pthread_mutex_unlock(&g_q_mutex);
 
-    /* 4) liberar todo */
+    pthread_kill(th_sig, SIGUSR1);   /* despierta sigwait si no hubo Ctrl+C */
+    pthread_join(th_sig, NULL);
+
+    /* 5) liberar todo */
     sem_destroy(&g_mesas_libres);
     free(clientes);
     free(mesas);
