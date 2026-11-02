@@ -88,6 +88,26 @@ void board_node_name(int node, char *buf, size_t sz) {
     else snprintf(buf, sz, "INVALIDO");
 }
 
+int board_neighbors(int node, int *out, int max) {
+    pthread_once(&graph_once, build_graph);
+    if (!valid_node(node)) return 0;
+    int n = 0;
+    for (int i = 0; i < adj_n[node] && n < max; i++) out[n++] = adj[node][i];
+    return n;
+}
+
+int board_jumps(int node, int *over, int *to, int max) {
+    pthread_once(&graph_once, build_graph);
+    if (!valid_node(node)) return 0;
+    int n = 0;
+    for (int i = 0; i < jmp_n[node] && n < max; i++) {
+        over[n] = jmp_over[node][i];
+        to[n] = jmp_to[node][i];
+        n++;
+    }
+    return n;
+}
+
 const char *move_result_str(MoveResult r) {
     switch (r) {
     case MOVE_OK: return "OK";
@@ -231,6 +251,21 @@ MoveResult board_move_dog(Board *b, int id, int from, int to) {
 }
 
 /* ---------- Consultas ---------- */
+
+int board_puma_pos(Board *b) {
+    pthread_mutex_lock(&b->lock);
+    int p = b->puma_pos;
+    pthread_mutex_unlock(&b->lock);
+    return p;
+}
+
+int board_dog_pos(Board *b, int id) {
+    if (id < 0 || id >= NUM_DOGS) return -1;
+    pthread_mutex_lock(&b->lock);
+    int p = b->dog_pos[id];
+    pthread_mutex_unlock(&b->lock);
+    return p;
+}
 
 GameStatus board_status(Board *b) {
     pthread_mutex_lock(&b->lock);

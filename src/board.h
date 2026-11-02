@@ -63,6 +63,12 @@ int board_node_from_rc(int row, int col); /* NODE_INVALID si esta fuera */
 void board_node_name(int node, char *buf, size_t sz);
 const char *move_result_str(MoveResult r);
 
+/* Consultas de grafo y posicion (para que las piezas elijan movimientos) */
+int board_neighbors(int node, int *out, int max);               /* cantidad escrita */
+int board_jumps(int node, int *over, int *to, int max);         /* cantidad escrita */
+int board_puma_pos(Board *b);                                   /* -1 si no esta */
+int board_dog_pos(Board *b, int id);                            /* -1 si no esta en juego */
+
 /* Ciclo de vida */
 int board_init(Board *b);     /* 0 = ok */
 void board_destroy(Board *b);
