@@ -8,11 +8,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 #include "matchmaker.h"
 #include "mesa.h"
 
 /* ---------- estado compartido ---------- */
 static atomic_int g_apagado = 0;          /* 1 = Ctrl+C recibido, hay que cerrar */
+static atomic_int g_terminado = 0;        /* 1 = el torneo ya acabo */
 static sem_t g_mesas_libres;              /* permisos disponibles = mesas libres */
 static pthread_mutex_t g_q_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_q_cond = PTHREAD_COND_INITIALIZER;
@@ -93,10 +95,23 @@ static void *hilo_senales(void *arg) {
     return NULL;
 }
 
+/* Simula el evento SIGNAL_SIGINT del archivo de casos: espera un momento
+ * (para que haya partidas en curso) y se manda SIGINT al propio proceso,
+ * igual que un Ctrl+C del usuario. Si el torneo termina antes, no lo envia. */
+static void *hilo_sigint_programado(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 30 && !atomic_load(&g_terminado); i++)
+        dormir_ms(10);
+    if (!atomic_load(&g_terminado))
+        kill(getpid(), SIGINT);
+    return NULL;
+}
+
 int torneo_run(int n, int m, const TestCase *tc) {
     g_tc = tc;
     g_total = n;
     atomic_store(&g_apagado, 0);
+    atomic_store(&g_terminado, 0);
     g_cola = calloc((size_t)n, sizeof(int));
     pthread_t *clientes = malloc((size_t)n * sizeof(pthread_t));
     pthread_t *mesas = malloc((size_t)(n / 2 + 1) * sizeof(pthread_t));
@@ -117,6 +132,15 @@ int torneo_run(int n, int m, const TestCase *tc) {
 
     pthread_t th_sig;
     pthread_create(&th_sig, NULL, hilo_senales, &set);
+
+    /* si el caso trae SIGNAL_SIGINT, lo disparamos nosotros */
+    int hay_sigint = 0;
+    pthread_t th_timer;
+    if (tc)
+        for (int i = 0; i < tc->n_events; i++)
+            if (tc->events[i].type == EV_SIGINT) hay_sigint = 1;
+    if (hay_sigint)
+        pthread_create(&th_timer, NULL, hilo_sigint_programado, NULL);
 
     /* 2) lanzar los N clientes */
     for (int i = 0; i < n; i++)
@@ -144,6 +168,9 @@ int torneo_run(int n, int m, const TestCase *tc) {
     /* 4) cierre ordenado: esperar a TODOS los hilos */
     for (int i = 0; i < n; i++) pthread_join(clientes[i], NULL);
     for (int i = 0; i < n_mesas; i++) pthread_join(mesas[i], NULL);
+
+    atomic_store(&g_terminado, 1);
+    if (hay_sigint) pthread_join(th_timer, NULL);
 
     pthread_mutex_lock(&g_q_mutex);
     int sobran = g_q_tail - g_q_head;
