@@ -3,3 +3,6 @@ torneo
 test_board
 *.log
 .vscode/
+salida.txt
+todos.txt
+val.txt
