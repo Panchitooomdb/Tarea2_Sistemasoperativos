@@ -6,3 +6,4 @@ test_board
 salida.txt
 todos.txt
 val.txt
+val_*.txt
